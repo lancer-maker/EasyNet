@@ -5,6 +5,7 @@ import tifffile
 from typing import Tuple, Iterator
 import warnings
 from loadwis import VirtualWIS
+import cv2
 
 
 
@@ -15,12 +16,25 @@ def lazy_load_wsi(filepath: str) -> np.ndarray:
         return tifffile.memmap(filepath)
 # 单通道：二维数组（H，W）
 # 多通道：三维数组（H，W，C），C=3 或 4（可能包含 alpha 通道）
+    
     except ValueError:
         print(f'[!] tifffile.memmap 加载失败，尝试 TiffFile对象读取模式: {filepath}')
         tif = tifffile.TiffFile(filepath)
         page = tif.pages[0]
         print(f'[*] 图像维度: {page.shape}, 数据类型: {page.dtype}, 通道数: {page.samplesperpixel}')
         return VirtualWIS(tif)
+    
+    except (tifffile.TiffFileError, KeyError) as e:
+        print(f"[!] 不是标准 TIFF 文件: {e}")
+        print(f"[*] 回退到 OpenCV 加载: {filepath}")
+        
+        img = cv2.imread(filepath, cv2.IMREAD_UNCHANGED)  
+        if img is None:
+            raise FileNotFoundError(f"OpenCV 无法读取文件: {filepath}")
+        if img.ndim == 3 and img.shape[2] == 3:
+            img = cv2.cvtColor(img, cv2.COLOR_BGR2RGB)
+        print(f'[*] 图像维度: {img.shape}, 数据类型: {img.dtype}, 通道数: {img.shape[2]}')
+        return img
 # 在 lazy_load_wsi 返回 VirtualWSI 之后，手动测试
 
 
@@ -319,7 +333,7 @@ class PatchExtractor:
                 
 if __name__ == "__main__":
     # 测试代码
-    file_path = "F:\\7710\\CH1\\Output2um_slice_02001_CH1.tif"
+    file_path = "D:\\files\\HE\\SICAPv2\\images\\\\16B0001851_Block_Region_1_0_0_xini_6803_yini_59786.jpg"
     image_mmap = lazy_load_wsi(file_path)
     modality = detect_modality(image_mmap)
     print(f"检测到的模态: {modality}")

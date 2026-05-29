@@ -26,12 +26,15 @@ class HEModel(BaseMTLModel):
         B = branch_a.size(0)
         # 灰度分支复制为3通道，与branch_a在batch维度拼接
         branch_b_3ch = branch_b_gray.repeat(1, 3, 1, 1)
+        # 多分支特征融合：在并行网络（如双路输入、多尺度特征）中，将不同分支的输出沿 batch 维度堆叠，然后一起送入后续层。
         combined = torch.cat([branch_a, branch_b_3ch], dim=0)  # (2B, 3, H, W)
 
         # 共享编码器一次前向
         x1, x2, x3, x4 = self.encoder(combined)
+        # 一次性送入后，前B个样本来自 branch_a，后B个样本来自 branch_b_gray。后续解码器根据索引分开处理。
 
         # 拆分特征（各层都需要拆）
+        # 接受一个张量f（2B, C, H, W），返回前B个样本和后B个样本
         def split_feat(f):
             return f[:B], f[B:]
         x1_a, x1_b = split_feat(x1)
@@ -48,10 +51,11 @@ class HEModel(BaseMTLModel):
         # 分支 B 上采样 + 输出
         feats_b = (x1_b, x2_b, x3_b, x4_b)
         dec_b = self.decoder_color(*feats_b)
-        color_out = torch.sigmoid(self.head_color(dec_b))  # RGB 值规约到[0,1]
+        color_out = self.head_color(dec_b)  # 原始logits，损失内含激活
 
+        # 统一数据交换接口
         return {
-            'semantic': semantic,      # 原始 logits（供 CrossEntropy）
-            'boundary': boundary,
-            'colorization': color_out
+            'semantic': semantic,       # logits (B, C, H, W)
+            'boundary': boundary,       # logits (B, 1, H, W)
+            'colorization': color_out   # sigmoid激活后的数值(B, 3, H, W)，值域 [0,1]
         }
