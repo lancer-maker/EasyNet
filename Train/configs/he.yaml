@@ -1,0 +1,41 @@
+modality: he
+backbone: unet
+base_channels: 64
+he_classes: 6                # 含背景、正常组织、微乳头、实性巢、单个细胞、肿瘤主体
+num_epochs: 200              # 可根据算力调整为 300
+lr: 1e-4
+batch_size: 8
+ema_decay: 0.999
+
+# 动态任务调度参数
+progress_thresh: 0.5
+sigma_ratio: 0.4             # 配合 num_epochs 使前 50% 着色权重缓降至 ~0.366
+task_weights_initial:
+  semantic: 1.0              # 主任务基准
+  boundary: 0.5              # 边界像素稀疏，权重略低
+  colorization: 0.8          # 自监督着色，与主任务同量级略低
+
+# 自训练置信度阈值
+self_training_conf_thresh: 0.9
+teacher_weak_thresh: 0.4
+
+
+data:
+  labeled_path: 
+  unlabeled_path: 
+  val_path: 
+  batch_size: 8
+  num_workers: 4
+  size: 512
+  
+  image_dir: images        # 可修改
+  mask_dir: masks
+  boundary_dir: null       # 若无独立边界标注则设为 null，自动从语义生成
+  image_ext: [.png, .tif, .tiff, .jpg, .jpeg]   # 支持格式
+  mask_ext: [.png, .tif, .tiff, .jpg, .jpeg]
+  color_jitter:            # 传递至 HEColorAugmentation 的参数
+    brightness: 0.4
+    contrast: 0.4
+    saturation: 0.4
+    hue: 0.1
+    p_blur: 0.2

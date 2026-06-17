@@ -68,7 +68,7 @@ def he_losses(outputs, labels, weights):
         target = labels['boundary']                # (B, 1, H, W) 二值
 
         # 加权 BCE（边界像素少，提高正样本权重）
-        pos_weight = torch.tensor([10.0], device=pred.device)  # 可配置
+        pos_weight = torch.tensor([10.0], device=pred_logits.device)  # 可配置
         bce_loss = F.binary_cross_entropy_with_logits(
             pred_logits, target, pos_weight=pos_weight
             )

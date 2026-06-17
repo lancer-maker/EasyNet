@@ -1,7 +1,7 @@
-# 通用的自监督任务权重调度器
+# HE自监督任务权重调度器
 import math
 
-class CyclicScheduler:
+class HEScheduler:
     def __init__(self, num_epochs, progress_thresh=0.5, sigma_ratio=0.3,
                  base_weights=None):
         self.total = num_epochs

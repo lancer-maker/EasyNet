@@ -4,7 +4,7 @@ from .base_model import BaseMTLModel
 from .backbones import UNetEncoder, UNetDecoder
 
 class HEModel(BaseMTLModel):
-    def __init__(self, he_classes=4, base=64):
+    def __init__(self, he_classes=6, base=64):
         super().__init__()
         # 共享编码器（三通道，灰度分支将1通道复制为3）
         self.encoder = UNetEncoder(in_channels=3, base=base)

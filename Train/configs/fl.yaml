@@ -1,0 +1,45 @@
+modality: fluorescence_weak
+backbone: unet
+base_channels: 64
+
+# 循环训练参数
+num_cycles: 5
+num_epochs_per_cycle: 40
+lr_classifier: 1e-4
+lr_seg: 1e-3
+batch_size: 8
+
+# 伪标签生成参数
+pseudo_label:
+  method: gradcam
+  threshold: 0.35
+  max_k: 20
+  min_area: 50
+  dilation_radius: 5
+  convex_hull: true
+
+# 损失权重
+lambda_sem: 0.5
+lambda_denoise: 0.1
+
+# 前端分类器参数
+classifier:
+  num_classes: 2
+  dropout: 0.5
+
+# 后端分割器参数
+segmenter:
+  num_classes: 1
+  denoise: true
+
+# 数据路径与增强
+data:
+  train_path: /path/to/fluor/train
+  class_label_file: /path/to/image_labels.csv
+  batch_size: 8
+  num_workers: 4
+  size: 512
+  noise_std: 0.05
+  brightness: 0.2
+  contrast: 0.2
+  image_ext: [.png, .tif, .tiff, .jpg, .jpeg]
