@@ -333,7 +333,7 @@ class PatchExtractor:
                 
 if __name__ == "__main__":
     # 测试代码
-    file_path = "D:\\files\\HE\\SICAPv2\\images\\\\16B0001851_Block_Region_1_0_0_xini_6803_yini_59786.jpg"
+    file_path = "G:\\7710\\CH1\\Output2um_slice_02001_CH1.tif"
     image_mmap = lazy_load_wsi(file_path)
     modality = detect_modality(image_mmap)
     print(f"检测到的模态: {modality}")

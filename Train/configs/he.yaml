@@ -1,10 +1,11 @@
 modality: he
 backbone: unet
 base_channels: 64
+global_base_channels:32      # 新增轻量Global基础通道配置
 he_classes: 6                # 含背景、正常组织、微乳头、实性巢、单个细胞、肿瘤主体
-num_epochs: 200              # 可根据算力调整为 300
+num_epochs: 10                # 可根据算力调整为 300，最低200，代码跑通测试可以很少
 lr: 1e-4
-batch_size: 8
+batch_size: 4
 ema_decay: 0.999
 
 # 动态任务调度参数
@@ -21,12 +22,18 @@ teacher_weak_thresh: 0.4
 
 
 data:
-  labeled_path: 
-  unlabeled_path: 
-  val_path: 
-  batch_size: 8
+  # labeled_path: D:/files/HE/test/labeled
+  # unlabeled_path: D:/files/HE/test/unlabeled
+  # val_path: D:/files/HE/test/val          # 验证集暂时使用标签组
+    # === 适配 Phase 1 双尺度 SVS 加载机制 ===
+  svs_dir: D:/files/HE/Case                # 真实 SVS 目录
+  geojson_dir: D:/files/HE/Case            # 真实 GeoJSON 目录
+  train_csv: D:/files/HE/train_patches.csv # 需新建: 包含 svs_name, cx, cy 字段
+  val_csv: D:/files/HE/val_patches.csv     # 需新建: 包含 svs_name, cx, cy 字段
+  
+  batch_size: 4
   num_workers: 4
-  size: 512
+  size: 256               # 可修改
   
   image_dir: images        # 可修改
   mask_dir: masks

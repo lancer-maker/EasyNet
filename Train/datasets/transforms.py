@@ -1,17 +1,13 @@
-'''
-HE 部分已验证
-'''
 # 数据增强与预处理（全 numpy float32 [0,1] 域操作）
 # 输入约定：
 #   - 图像：float32 (H,W,3) 或 (H,W) ，值域 [0,1]
 #   - 掩码：uint8 或 int (H,W)
 # 所有变换保证空间一致性，并自动裁剪/填充到固定尺寸。
-
-
+# HE 双尺度 + 荧光多任务 统一数据增强与预处理
 import random
 import numpy as np
 import cv2
-
+from .mask_utils import generate_boundary_from_semantic
 
 class Compose:
     def __init__(self, transforms):
@@ -21,191 +17,132 @@ class Compose:
         for t in self.transforms:
             arrays = t(*arrays)
         return arrays
-
-
+    
+# =====================================================================
+# 二、 H&E 双尺度特化增强 (Dual-Scale + Dual-Branch)
+# =====================================================================
 class HEGeometricTransform:
-    """几何增强：旋转、翻转、缩放裁剪（保持 float32）"""
-    def __init__(self, size=512, scale=(0.8, 1.2), rotation=15, p_flip=0.5):
-        self.size = size
-        self.scale = scale
-        self.rotation = rotation
+    """
+    双尺度空间严格同步增强：
+    对 Local (512x512) 与 Global (512x512) 施加完全相同的正交几何拓扑变换，
+    不使用任意比例缩放裁剪，确保物理对应点在像素矩阵中绝对重合。
+    """
+    def __init__(self, p_flip: float = 0.5, p_rot90: float = 0.5):
+        self.p_rot90 = p_rot90
         self.p_flip = p_flip
 
-    def __call__(self, img, mask_sem=None, mask_boundary=None):
-        h, w = img.shape[:2]
-
-        # 随机缩放
-        scale = random.uniform(*self.scale)
-        new_h, new_w = int(h * scale), int(w * scale)
-        img = cv2.resize(img, (new_w, new_h), interpolation=cv2.INTER_LINEAR)
-        if mask_sem is not None:
-            mask_sem = cv2.resize(mask_sem, (new_w, new_h), interpolation=cv2.INTER_NEAREST)
-        if mask_boundary is not None:
-            mask_boundary = cv2.resize(mask_boundary, (new_w, new_h), interpolation=cv2.INTER_NEAREST)
-
-        # 随机裁剪或填充到固定尺寸
-        img, mask_sem, mask_boundary = self._crop_or_pad(img, mask_sem, mask_boundary, self.size)
-
-        # 随机旋转
-        angle = random.uniform(-self.rotation, self.rotation)
-        img = self._rotate_image(img, angle, cv2.INTER_LINEAR)
-        if mask_sem is not None:
-            mask_sem = self._rotate_image(mask_sem, angle, cv2.INTER_NEAREST)
-        if mask_boundary is not None:
-            mask_boundary = self._rotate_image(mask_boundary, angle, cv2.INTER_NEAREST)
-
-        # 随机水平翻转
+    def __call__(self, local_img, global_img, mask_sem=None, mask_boundary=None):
+        # 1.水平镜像
         if random.random() < self.p_flip:
-            img = np.ascontiguousarray(img[:, ::-1])
+            local_img = np.ascontiguousarray(local_img[:, ::-1])
+            global_img = np.ascontiguousarray(global_img[:, ::-1])
             if mask_sem is not None:
                 mask_sem = np.ascontiguousarray(mask_sem[:, ::-1])
             if mask_boundary is not None:
                 mask_boundary = np.ascontiguousarray(mask_boundary[:, ::-1])
 
-        return img, mask_sem, mask_boundary
-
-    def _crop_or_pad(self, img, mask_sem, mask_boundary, size):
-        h, w = img.shape[:2]
-        # 如果小于目标尺寸，对称填充 0
-        if h < size or w < size:
-            pad_h = max(0, size - h)
-            pad_w = max(0, size - w)
-            img = cv2.copyMakeBorder(img, 0, pad_h, 0, pad_w,
-                                     borderType=cv2.BORDER_CONSTANT, value=0.0)
+        # 2.垂直镜像
+        if random.random() < self.p_flip:
+            local_img = np.ascontiguousarray(local_img[::-1, :])
+            global_img = np.ascontiguousarray(global_img[::-1, :])
             if mask_sem is not None:
-                mask_sem = cv2.copyMakeBorder(mask_sem, 0, pad_h, 0, pad_w,
-                                              borderType=cv2.BORDER_CONSTANT, value=0)
+                mask_sem = np.ascontiguousarray(mask_sem[::-1, :])
             if mask_boundary is not None:
-                mask_boundary = cv2.copyMakeBorder(mask_boundary, 0, pad_h, 0, pad_w,
-                                                   borderType=cv2.BORDER_CONSTANT, value=0)
-            h, w = img.shape[:2]
+                mask_boundary = np.ascontiguousarray(mask_boundary[::-1, :])
 
-        # 随机裁剪
-        y = random.randint(0, max(0, h - size))
-        x = random.randint(0, max(0, w - size))
-        img = img[y:y+size, x:x+size]
-        if mask_sem is not None:
-            mask_sem = mask_sem[y:y+size, x:x+size]
-        if mask_boundary is not None:
-            mask_boundary = mask_boundary[y:y+size, x:x+size]
-        return img, mask_sem, mask_boundary
+        # 3.90度正交旋转
+        if random.random() < self.p_rot90:
+            k = random.choice([1, 2, 3])  # 随机选择逆时针旋转90(1)、180(2)、270(3)度
+            local_img = np.ascontiguousarray(np.rot90(local_img, k))
+            global_img = np.ascontiguousarray(np.rot90(global_img, k))
+            if mask_sem is not None:
+                mask_sem = np.ascontiguousarray(np.rot90(mask_sem, k))
+            if mask_boundary is not None:
+                mask_boundary = np.ascontiguousarray(np.rot90(mask_boundary, k))
 
-    @staticmethod
-    def _rotate_image(img, angle, interp):
-        h, w = img.shape[:2]
-        M = cv2.getRotationMatrix2D((w/2, h/2), angle, 1.0)         # 计算以图像中心为旋转中心、旋转 angle 度、不缩放的仿射变换矩阵。
-        return cv2.warpAffine(img, M, (w, h), flags=interp,
-                              borderMode=cv2.BORDER_REFLECT_101)    # 仿射变换，输出尺寸与原图一致 (w, h)，插值方法由参数 interp 指定，边界填充模式为 cv2.BORDER_REFLECT_101（反射填充，避免边界伪影）
-
-
+        return local_img, global_img, mask_sem, mask_boundary
+    
 class HEColorAugmentation:
     """
-    极致颜色增强，仅作用于分支A的 RGB 图 (H,W,3) float32 [0,1]
+    仅施加于 Local RGB - RGB分支的极致颜色增强, (H,W,3) float32 [0,1]
+    基于标准 HSV 色彩空间
     """
-    def __init__(self, brightness=0.4, contrast=0.4, saturation=0.4, hue=0.1, p_blur=0.2):
+    def __init__(self, brightness=0.3, contrast=0.3, saturation=0.3, hue=0.08, p_blur=0.2):
         self.brightness = brightness
         self.contrast = contrast
         self.saturation = saturation
         self.hue = hue
         self.p_blur = p_blur            # config中有对应数值，在train中再调用config，保持代码简洁
 
-    def __call__(self, img):
-        img = img.copy()
-        # 亮度
-        factor = 1.0 + random.uniform(-self.brightness, self.brightness)
-        img = np.clip(img * factor, 0, 1)
+    def __call__(self, img: np.ndarray) -> np.ndarray:
+        img_u8 = (np.clip(img, 0.0, 1.0) * 255.0).astype(np.uint8)
+        hsv = cv2.cvtColor(img_u8, cv2.COLOR_RGB2HSV).astype(np.float32)
 
-        # 对比度
-        factor = 1.0 + random.uniform(-self.contrast, self.contrast)
-        gray = np.mean(img, axis=-1, keepdims=True)
-        img = np.clip(gray + factor * (img - gray), 0, 1)
+        # 色调 (H) 与饱和度 (S) 扰动
+        hsv[:, :, 0] = (hsv[:, :, 0] + random.uniform(-self.hue, self.hue) * 180.0) % 180.0
+        hsv[:, :, 1] = np.clip(hsv[:, :, 1] * (1.0 + random.uniform(-self.saturation, self.saturation)), 0.0, 255.0)
 
-        # 饱和度
-        factor = 1.0 + random.uniform(-self.saturation, self.saturation)
-        gray = np.mean(img, axis=-1, keepdims=True)
-        img = np.clip(gray + factor * (img - gray), 0, 1)
+        # 明度 (V) 与对比度扰动
+        v = hsv[:, :, 2] / 255.0
+        v = np.clip(v * (1.0 + random.uniform(-self.brightness, self.brightness)), 0.0, 1.0)
+        mean_v = np.mean(v)
+        v = np.clip(mean_v + (1.0 + random.uniform(-self.contrast, self.contrast)) * (v - mean_v), 0.0, 1.0)
+        hsv[:, :, 2] = v * 255.0
 
-        # 色调（在 RGB 上近似旋转）
-        factor = random.uniform(-self.hue, self.hue)
-        img = self._hue_rotate(img, factor)
+        rgb = cv2.cvtColor(hsv.astype(np.uint8), cv2.COLOR_HSV2RGB).astype(np.float32) / 255.0
 
-        # 高斯模糊（直接对 float32 图像）
         if random.random() < self.p_blur:
             ksize = random.choice([3, 5])
-            sigma = random.uniform(0.5, 1.5)
-            img = cv2.GaussianBlur(img, (ksize, ksize), sigmaX=sigma, sigmaY=sigma)
+            rgb = cv2.GaussianBlur(rgb, (ksize, ksize), sigmaX=1.0)
 
-        return np.clip(img, 0, 1)
-
-    @staticmethod
-    def _hue_rotate(img, delta):
-        """在 HSV 空间旋转色调（输入输出 float32 [0,1]）"""
-        # 转为 uint8 供 OpenCV 处理
-        img_u8 = (img * 255).astype(np.uint8)
-        hsv = cv2.cvtColor(img_u8, cv2.COLOR_RGB2HSV).astype(np.float32)
-        hsv[:, :, 0] = (hsv[:, :, 0] + delta * 180) % 180
-        hsv = np.clip(hsv, 0, 255).astype(np.uint8)
-        rgb = cv2.cvtColor(hsv, cv2.COLOR_HSV2RGB).astype(np.float32) / 255.0
-        return rgb
+        return np.clip(rgb, 0.0, 1.0)
 
 
 class HETrainTransform:
     """
-    HE 训练完整变换（内部保持 float32 [0,1]）
-    返回：
-        image_aug:     (H,W,3) float32 [0,1] 分支A
-        image_gray:    (H,W) float32 [0,1]   分支B
-        original_rgb:  (H,W,3) float32 [0,1] 着色目标
-        mask_sem:      (H,W) uint8 (可选)
-        mask_boundary: (H,W) uint8 (可选)
+    HE 双尺度训练组合变换器
+    接收: local_img (512,512,3), global_img (512,512,3), mask_sem, mask_boundary
+    返回:
+        local_branch_a:     Local 强色彩增强 RGB (用于结构语义学习)
+        local_branch_b_gray:Local 纯灰度图 (用于自监督着色任务输入)
+        orig_local_rgb:     Local 原始 RGB (自监督着色 Ground Truth)
+        global_branch:      Global 原始 RGB (宏观上下文输入)
+        mask_sem:           语义掩码
+        mask_boundary:      边界掩码
     """
-    def __init__(self, size=512, color_jitter_params=None):
-        self.geo_transform = HEGeometricTransform(size=size)
+    def __init__(self, color_jitter_params=None):
+        self.geo_transform = HEGeometricTransform()
         self.color_aug = HEColorAugmentation(**(color_jitter_params or {}))
 
-    def __call__(self, img, mask_sem=None, mask_boundary=None):
-        # 1. 几何增强（统一变换）
-        img, mask_sem, mask_boundary = self.geo_transform(img, mask_sem, mask_boundary)
+    def __call__(self, local_img, global_img, mask_sem=None, mask_boundary=None):
+        # 1. 双尺度空间同屏几何变换
+        local_img, global_img, mask_sem, mask_boundary = self.geo_transform(
+            local_img, global_img, mask_sem, mask_boundary
+            )
+        # 2. Local 双分支生成
+        orig_local_rgb = local_img.copy()
+        local_branch_a = self.color_aug(local_img)
+        local_branch_b_gray = (
+            0.299 * local_img[:, :, 0] + 
+            0.587 * local_img[:, :, 1] + 
+            0.114 * local_img[:, :, 2]
+        )# 三色通道转换灰度公式
 
-        # 2. 保留原始色彩
-        original_rgb = img.copy()
+        # 3. Global 分支保持真实物理采样色彩
+        global_branch = global_img.copy()
 
-        # 3. 分支A：颜色增强
-        image_aug = self.color_aug(img)
-
-        # 4. 分支B：灰度（直接浮点计算，无量化损失）
-        image_gray = 0.299 * original_rgb[:, :, 0] + 0.587 * original_rgb[:, :, 1] + 0.114 * original_rgb[:, :, 2]
-
-        return image_aug, image_gray, original_rgb, mask_sem, mask_boundary
-
+        return local_branch_a, local_branch_b_gray, orig_local_rgb, global_branch, mask_sem, mask_boundary
 
 class HEValTransform:
-    """HE 验证变换（无增强，仅统一尺寸）"""
-    def __init__(self, size=512):
-        self.size = size
-
-    def __call__(self, img, mask_sem=None, mask_boundary=None):
-        h, w = img.shape[:2]
-        scale = self.size / min(h, w)
-        new_h, new_w = int(h * scale), int(w * scale)
-        img = cv2.resize(img, (new_w, new_h), interpolation=cv2.INTER_LINEAR)
-        if mask_sem is not None:
-            mask_sem = cv2.resize(mask_sem, (new_w, new_h), interpolation=cv2.INTER_NEAREST)
-        if mask_boundary is not None:
-            mask_boundary = cv2.resize(mask_boundary, (new_w, new_h), interpolation=cv2.INTER_NEAREST)
-
-        # 中心裁剪
-        y = (new_h - self.size) // 2
-        x = (new_w - self.size) // 2
-        img = img[y:y+self.size, x:x+self.size]
-        if mask_sem is not None:
-            mask_sem = mask_sem[y:y+self.size, x:x+self.size]
-        if mask_boundary is not None:
-            mask_boundary = mask_boundary[y:y+self.size, x:x+self.size]
-
-        image_gray = 0.299 * img[:, :, 0] + 0.587 * img[:, :, 1] + 0.114 * img[:, :, 2]
-        return img, image_gray, img.copy(), mask_sem, mask_boundary
-
+    """HE 双尺度验证变换器（无随机增强，仅做数据类型装配）"""
+    def __call__(self, local_img, global_img, mask_sem=None, mask_boundary=None):
+        orig_local_rgb = local_img.copy()
+        local_branch_b_gray = (
+            0.299 * orig_local_rgb[:, :, 0] +
+            0.587 * orig_local_rgb[:, :, 1] +
+            0.114 * orig_local_rgb[:, :, 2]
+        )
+        return local_img, local_branch_b_gray, orig_local_rgb, global_img, mask_sem, mask_boundary
 
 class FluorescenceTransform:
     """
@@ -239,18 +176,3 @@ class FluorescenceTransform:
 
         return img.transpose(2, 0, 1)   # (C, H, W)
 
-
-# 边界掩码生成（语义->边界）
-def generate_boundary_from_semantic(semantic_mask, dilation_radius=2):
-    """
-    semantic_mask: (H,W) uint8 或 int，0=背景
-    returns: (H,W) uint8 (0/1)
-    """
-    foreground = (semantic_mask > 0).astype(np.uint8)
-    if foreground.sum() == 0:
-        return foreground
-    kernel = cv2.getStructuringElement(cv2.MORPH_ELLIPSE,
-                                       (dilation_radius * 2 + 1, dilation_radius * 2 + 1))
-    dilated = cv2.dilate(foreground, kernel, iterations=1)
-    eroded = cv2.erode(foreground, kernel, iterations=1)
-    return dilated - eroded

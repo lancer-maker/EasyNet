@@ -8,15 +8,51 @@ class DoubleConv(nn.Module):
         super().__init__()
         self.conv = nn.Sequential(
             nn.Conv2d(in_ch, out_ch, 3, padding=1, bias=False),
-            nn.BatchNorm2d(out_ch),
+            nn.BatchNorm2d(out_ch, eps = 1e-4),
             nn.ReLU(inplace=True),
 
             nn.Conv2d(out_ch, out_ch, 3, padding=1, bias=False),
-            nn.BatchNorm2d(out_ch),
+            nn.BatchNorm2d(out_ch, eps = 1e-4),
             nn.ReLU(inplace=True)
         )
     def forward(self, x):
         return self.conv(x)
+# ==========================================
+# 新增: Global 轻量级编码器
+# ==========================================
+class LightGlobalEncoder(nn.Module):
+    """Global 专用轻量编码器：默认通道减半，极大节省显存"""
+    def __init__(self, in_channels=3, base=32): 
+        super().__init__()
+        self.inc = DoubleConv(in_channels, base)
+        self.down1 = nn.Sequential(nn.MaxPool2d(2), DoubleConv(base, base*2))
+        self.down2 = nn.Sequential(nn.MaxPool2d(2), DoubleConv(base*2, base*4))
+        self.down3 = nn.Sequential(nn.MaxPool2d(2), DoubleConv(base*4, base*8))
+
+    def forward(self, x):
+        x1 = self.inc(x)      
+        x2 = self.down1(x1)   
+        x3 = self.down2(x2)   
+        x4 = self.down3(x3)   
+        return x1, x2, x3, x4
+
+# ==========================================
+# 新增: 跨尺度特征融合块
+# ==========================================
+class FeatureFusionBlock(nn.Module):
+    """将 Local 和 Global 拼接后通过 1x1 卷积降维，恢复至原 Local 通道数"""
+    def __init__(self, local_ch, global_ch):
+        super().__init__()
+        self.fusion = nn.Sequential(
+            nn.Conv2d(local_ch + global_ch, local_ch, kernel_size=1, bias=False),
+            nn.BatchNorm2d(local_ch),
+            nn.ReLU(inplace=True)
+        )
+
+    def forward(self, local_feat, global_feat):
+        concat_feat = torch.cat([local_feat, global_feat], dim=1)
+        return self.fusion(concat_feat)
+
 
 class UNetEncoder(nn.Module):
     """共享编码器（下采样 3 次）"""

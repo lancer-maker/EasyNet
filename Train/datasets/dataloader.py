@@ -11,8 +11,10 @@ import torch
 from torch.utils.data import Dataset, DataLoader, ConcatDataset
 from .transforms import (
     HETrainTransform, HEValTransform, FluorescenceTransform,
-    generate_boundary_from_semantic
 )
+from .wsi_reader import WSIReader
+from .geojson_utils import GeoJSONManager
+from .mask_utils import generate_boundary_from_semantic
 
 
 def _normalize_image_by_dtype(img: np.ndarray) -> np.ndarray:
@@ -26,141 +28,120 @@ def _normalize_image_by_dtype(img: np.ndarray) -> np.ndarray:
         return img.astype(np.float32)
 
 
-def _load_and_normalize(path: Path, color: bool = True):
+class WSIHEDataset(Dataset):
     """
-    读取图像并归一化到 float32 [0,1]。
-    color=True  → RGB (H,W,3)
-    color=False → 灰度 (H,W)
+    双尺度 WSI 训练数据集：支持有标签与无标签半监督数据的安全隔离。
+    统一绝对基准：Level-0 像素坐标。
     """
-    flag = cv2.IMREAD_COLOR if color else cv2.IMREAD_GRAYSCALE
-    img = cv2.imread(str(path), flag)
-    if img is None:
-        raise IOError(f"Cannot read image: {path}")
-    if color:
-        img = cv2.cvtColor(img, cv2.COLOR_BGR2RGB)
-    return _normalize_image_by_dtype(img)
-
-
-class HEDataset(Dataset):
-    """HE 数据集（有标签/无标签），支持混合位深度和多格式"""
-    def __init__(self, root, labeled=True, transform=None,
-                 image_dir='images', mask_dir='masks', boundary_dir=None,
-                 image_ext=None, mask_ext=None):
-        self.root = Path(root)
-        self.labeled = labeled
+    def __init__(self, svs_dir, patch_list, geojson_dir=None, transform=None, size=512, max_cache_size=2):
+        """
+        patch_list: 包含采样点信息的字典列表 [{"svs_name": "x.svs", "cx": 1000, "cy": 1000}, ...]
+        max_cache_size: 单个 worker 允许同时缓存的最大 WSI 数量。
+        """
+        self.svs_dir = Path(svs_dir)
+        self.geojson_dir = Path(geojson_dir) if geojson_dir else None
+        self.patch_list = patch_list
         self.transform = transform
-        self.image_dir = self.root / image_dir
-        self.mask_dir = self.root / mask_dir if mask_dir else None
-        self.boundary_dir = self.root / boundary_dir if boundary_dir else None
+        self.size = size
 
-        # 扩展名处理：支持字符串或元组，统一为小写元组
-        if image_ext is None:
-            image_ext = ('.png', '.tif', '.tiff', '.jpg', '.jpeg')
-        if mask_ext is None:
-            mask_ext = ('.png', '.tif', '.tiff')
-        if isinstance(image_ext, str):
-            image_ext = (image_ext,)
-        if isinstance(mask_ext, str):
-            mask_ext = (mask_ext,)
-        self.image_ext = tuple(ext.lower() for ext in image_ext)
-        self.mask_ext = tuple(ext.lower() for ext in mask_ext)
+        # LRU 缓存控制
+        self.max_cache_size = max_cache_size
+        self.wsi_cache = {}
+        self.geo_cache = {}
+        self.cache_keys = []  # 记录使用顺序，队尾为最新使用
 
-        # 收集图像文件名（仅文件名，不含路径）
-        if not self.image_dir.exists():
-            raise ValueError(f"Image directory not found: {self.image_dir}")
-        image_files = []
-        for f in self.image_dir.iterdir():
-            if f.is_file() and f.suffix.lower() in self.image_ext:
-                image_files.append(f.name)
-        self.images = sorted(image_files)
+    def _get_managers(self, svs_name: str):
+        if svs_name not in self.wsi_cache:
+            # 1. 触发 LRU 淘汰机制
+            if len(self.cache_keys) >= self.max_cache_size:
+                oldest_svs = self.cache_keys.pop(0)  # 弹出最旧的
+                old_reader = self.wsi_cache.pop(oldest_svs)
+                self.geo_cache.pop(oldest_svs)
+                # 显式关闭文件句柄，防止 OOM 与 Errno 24
+                if hasattr(old_reader.slide, 'close'):
+                    old_reader.slide.close()
 
-        if labeled:
-            if not self.mask_dir or not self.mask_dir.exists():
-                raise ValueError(f"Mask directory not found: {self.mask_dir}")
-            # 确保图像有对应掩码
-            matched = []
-            for img_name in self.images:
-                base = Path(img_name).stem                      # Path(img_name)：用 pathlib.Path 把字符串 img_name 转成路径对象。.stem：返回该路径最后一部分（文件名）去掉最后一个后缀后的字符串
-                found = False                                   # eg. img_name = 'img_001.tif' → base = 'img_001'
-                for ext in self.mask_ext:
-                    if (self.mask_dir / (base + ext)).exists(): # 此处为多扩展名支持，检查 mask_dir 下是否存在与图像同名但扩展名为 mask_ext 中任一的文件
-                        found = True
-                        break
-                if found:
-                    matched.append(img_name)
-            self.images = matched
+            # 2. 加载新的 WSI 读取器
+            self.wsi_cache[svs_name] = WSIReader(self.svs_dir / svs_name)
+            
+            # 3. 加载新的 GeoJSON 空间索引 (若存在)
+            self.geo_cache[svs_name] = None
+            if self.geojson_dir:
+                json_path = self.geojson_dir / (Path(svs_name).stem + ".geojson")
+                if json_path.exists():
+                    self.geo_cache[svs_name] = GeoJSONManager(json_path)
+            
+            self.cache_keys.append(svs_name)
+        else:
+            # 更新使用顺序 (移动到队尾)
+            self.cache_keys.remove(svs_name)
+            self.cache_keys.append(svs_name)
+
+        return self.wsi_cache[svs_name], self.geo_cache[svs_name]
 
     def __len__(self):
-        return len(self.images)
+        return len(self.patch_list)
 
     def __getitem__(self, idx):
-        try:
-            img_name = self.images[idx]
-            img_path = self.image_dir / img_name
-            image = _load_and_normalize(img_path, color=True)   # (H,W,3) float32
+        info = self.patch_list[idx]
+        svs_name = info['svs_name']
+        cx, cy = int(info['cx']), int(info['cy'])
 
-            mask_sem = None
-            mask_boundary = None
+        wsi_reader, geo_manager = self._get_managers(svs_name)
 
-        except Exception as e:
-            print(f"Error loading image {img_name}: {e}")
-            return None
+        # 1. 双尺度提取 (保证返回 float32 [0,1], 形状精确为 512x512x3)
+        local_img = wsi_reader.read_region_safe(cx, cy, level=0, output_size=self.size)
+        global_img = wsi_reader.read_region_safe(cx, cy, level=2, output_size=self.size)
 
-        if self.labeled:
-            # 寻找匹配的掩码
-            base = Path(img_name).stem
-            mask_path = None
-            for ext in self.mask_ext:
-                candidate = self.mask_dir / (base + ext)
-                if candidate.exists():
-                    mask_path = candidate
-                    break
-            if mask_path is None:
-                raise FileNotFoundError(f"Mask not found for {img_name} in {self.mask_dir}")
+        # 2. 标签生成（严格区分有监督与无标签半监督数据）
+        if geo_manager is not None:
+            mask_sem = geo_manager.rasterize_patch(cx, cy, patch_size=self.size)
+        else:
+            # 无标签数据：绝对初始化为 255 (Ignore)
+            mask_sem = np.full((self.size, self.size), 255, dtype=np.uint8)
 
-            mask_sem = cv2.imread(str(mask_path), cv2.IMREAD_GRAYSCALE)         # 以灰度模式从磁盘读取 mask 文件并返回为 NumPy 数组
-            if mask_sem is None:
-                raise IOError(f"Cannot read mask: {mask_path}")
-            # 掩码保留原始整数类别
+        mask_boundary = generate_boundary_from_semantic(mask_sem)
 
-            # 边界掩码
-            if self.boundary_dir:
-                boundary_path = self.boundary_dir / (base + mask_path.suffix)   # Path.suffix 返回路径最后一部分的最后一个后缀（包含前导点），例如返回 '.txt'
-                if boundary_path.exists():
-                    mask_boundary = cv2.imread(str(boundary_path), cv2.IMREAD_GRAYSCALE)
-                    if mask_boundary is not None:
-                        mask_boundary = (mask_boundary > 127).astype(np.uint8)  # 由于后续损失函数使用的BCEWithLogitsLoss ，需要将边界掩码转换为二值化的 uint8 格式（0 或 1），以便正确计算边界损失 
-            if mask_boundary is None:                                           # 可能是cv2读取失败或 boundary_dir 不存在，此时从语义掩码生成边界
-                mask_boundary = generate_boundary_from_semantic(mask_sem)
-
-        # 应用变换：统一数据格式，确保无论是否配置了数据增强（self.transform），后续流程都能拿到模型所需的 (image_aug, image_gray, original_rgb, mask_sem, mask_boundary) 五个输出
+        # 3. 数据变换
         if self.transform:
-            image_aug, image_gray, original_rgb, mask_sem, mask_boundary = self.transform(
-                image, mask_sem, mask_boundary
+            branch_a, branch_b_gray, orig_local, global_rgb, mask_sem, mask_boundary = self.transform(
+                local_img, global_img, mask_sem, mask_boundary
             )
         else:
-            image_aug = image
-            image_gray = 0.299 * image[:, :, 0] + 0.587 * image[:, :, 1] + 0.114 * image[:, :, 2]   # 灰度化公式（0.299·R + 0.587·G + 0.114·B）
-            original_rgb = image.copy()
+            branch_a = local_img
+            branch_b_gray = 0.299 * local_img[:, :, 0] + 0.587 * local_img[:, :, 1] + 0.114 * local_img[:, :, 2]
+            orig_local = local_img.copy()
+            global_rgb = global_img
 
-        # 转为 tensor
-        branch_a = torch.from_numpy(image_aug.transpose(2, 0, 1))  # (3,H,W)
-        branch_b_gray = torch.from_numpy(image_gray).unsqueeze(0)   # (1,H,W)
-        original_rgb_t = torch.from_numpy(original_rgb.transpose(2, 0, 1))
-
-        sample = {
-            'branch_a': branch_a,
-            'branch_b_gray': branch_b_gray,
-            'original_rgb': original_rgb_t,
-            'filename': img_name
+        return {
+            'branch_a': torch.from_numpy(branch_a.transpose(2, 0, 1)).float(),           # (3, H, W)
+            'branch_b_gray': torch.from_numpy(branch_b_gray).unsqueeze(0).float(),       # (1, H, W)
+            'original_rgb': torch.from_numpy(orig_local.transpose(2, 0, 1)).float(),     # (3, H, W)
+            'global_rgb': torch.from_numpy(global_rgb.transpose(2, 0, 1)).float(),       # (3, H, W)
+            'semantic': torch.from_numpy(mask_sem).long(),                               # (H, W) 取值 0~5 及 255
+            'boundary': torch.from_numpy(mask_boundary).unsqueeze(0).float(),            # (1, H, W) 取值 0, 1
+            'is_labeled': torch.tensor(1 if geo_manager is not None else 0, dtype=torch.uint8),
+            'filename': f"{svs_name}_X{cx}_Y{cy}"
         }
 
-        if self.labeled:
-            sample['semantic'] = torch.from_numpy(mask_sem).long()
-            sample['boundary'] = torch.from_numpy(mask_boundary).float().unsqueeze(0)
+def he_collate_fn(batch):
+    """支持有标签与无标签混合堆叠的 Collate 函数"""
+    # 过滤可能因为读取失败返回 None 的样本
+    batch = [b for b in batch if b is not None]
+    if len(batch) == 0:
+        return {}
 
-        return sample
-
+    collated = {
+        'branch_a': torch.stack([s['branch_a'] for s in batch]),
+        'branch_b_gray': torch.stack([s['branch_b_gray'] for s in batch]),
+        'original_rgb': torch.stack([s['original_rgb'] for s in batch]),
+        'global_rgb': torch.stack([s['global_rgb'] for s in batch]),
+        'semantic': torch.stack([s['semantic'] for s in batch]),
+        'boundary': torch.stack([s['boundary'] for s in batch]),
+        'is_labeled': torch.stack([s['is_labeled'] for s in batch]),
+        'filename': [s['filename'] for s in batch]
+    }
+    return collated
 
 class FluorescenceDataset(Dataset):
     """荧光弱监督数据集：root/class_name/*.ext, 输出归一化图像和干净目标"""
@@ -223,93 +204,41 @@ class FluorescenceDataset(Dataset):
             'filename': img_path.name
         }
     
-def he_collate_fn(batch):
-    """
-    处理 HE 混合 batch：缺失的 semantic 用 ignore_index(255) 填充，
-    缺失的 boundary 用 0 填充。
-    """
-    collated = {}
-
-    # 基础图像字段（一定有）
-    for key in ['branch_a', 'branch_b_gray', 'original_rgb']:
-        collated[key] = torch.stack([s[key] for s in batch])
-
-    # 文件名保留为列表
-    collated['filename'] = [s['filename'] for s in batch]
-
-    # 语义掩码：缺失时填充 255 (ignore_index)
-    semantic_list = []
-    for s in batch:
-        if 'semantic' in s:
-            semantic_list.append(s['semantic'])
-        else:
-            # 根据 branch_a 的空间尺寸创建全 255 张量
-            _, H, W = s['branch_a'].shape
-            semantic_list.append(torch.full((H, W), 255, dtype=torch.long))
-    collated['semantic'] = torch.stack(semantic_list)
-
-    # 边界掩码：缺失时填充 0
-    boundary_list = []
-    for s in batch:
-        if 'boundary' in s:
-            boundary_list.append(s['boundary'])
-        else:
-            _, H, W = s['branch_a'].shape
-            boundary_list.append(torch.zeros((1, H, W), dtype=torch.float))
-    collated['boundary'] = torch.stack(boundary_list)
-
-    return collated
 
 def get_dataloader(config, split='train'):
     modality = config['modality'].lower()
     data_cfg = config['data']
 
     if modality == 'he':
+        # --- HE 双尺度 WSI 模式 ---
+        # 依赖配置文件提供 csv_path (包含 svs_name, cx, cy)，以及 svs_dir, geojson_dir
+        csv_key = 'train_csv' if split == 'train' else 'val_csv'
+        if csv_key not in data_cfg:
+            raise ValueError(f"Missing '{csv_key}' in HE config for WSI sampling.")
+            
+        df = pd.read_csv(data_cfg[csv_key])
+        patch_list = df.to_dict('records') # 转为 [{'svs_name':'..', 'cx':.., 'cy':..}, ...]
+
         if split == 'train':
-            train_transform = HETrainTransform(
-                size=data_cfg.get('size', 512),
-                color_jitter_params=data_cfg.get('color_jitter', {})
-            )
-            labeled_dataset = HEDataset(
-                root=data_cfg['labeled_path'],
-                labeled=True,
-                transform=train_transform,
-                image_dir=data_cfg.get('image_dir', 'images'),
-                mask_dir=data_cfg.get('mask_dir', 'masks'),
-                boundary_dir=data_cfg.get('boundary_dir', None),
-                image_ext=data_cfg.get('image_ext', None),
-                mask_ext=data_cfg.get('mask_ext', None)
-            )
-            unlabeled_dataset = HEDataset(
-                root=data_cfg['unlabeled_path'],
-                labeled=False,
-                transform=train_transform,
-                image_dir=data_cfg.get('image_dir', 'images'),
-                image_ext=data_cfg.get('image_ext', None)
-            )
-            dataset = ConcatDataset([labeled_dataset, unlabeled_dataset])
-            batch_size = data_cfg.get('batch_size', 8)
+            transform = HETrainTransform(color_jitter_params=data_cfg.get('color_jitter', {}))
             shuffle = True
-        else:   # val
-            val_transform = HEValTransform(size=data_cfg.get('size', 512))
-            dataset = HEDataset(
-                root=data_cfg['val_path'],
-                labeled=True,
-                transform=val_transform,
-                image_dir=data_cfg.get('image_dir', 'images'),
-                mask_dir=data_cfg.get('mask_dir', 'masks'),
-                boundary_dir=data_cfg.get('boundary_dir', None),
-                image_ext=data_cfg.get('image_ext', None),
-                mask_ext=data_cfg.get('mask_ext', None)
-            )
-            batch_size = data_cfg.get('batch_size', 4)
+        else:
+            transform = HEValTransform()
             shuffle = False
 
-        dataloader = DataLoader(
-            dataset, 
-            batch_size=batch_size, 
+        dataset = WSIHEDataset(
+            svs_dir=data_cfg['svs_dir'],
+            patch_list=patch_list,
+            geojson_dir=data_cfg.get('geojson_dir', None),
+            transform=transform,
+            size=data_cfg.get('size', 512)
+        )
+        
+        return DataLoader(
+            dataset,
+            batch_size=data_cfg.get('batch_size', 8),
             shuffle=shuffle,
-            num_workers=data_cfg.get('num_workers', 4), 
+            num_workers=data_cfg.get('num_workers', 4),
             pin_memory=True,
             collate_fn=he_collate_fn
         )
@@ -340,6 +269,6 @@ def get_dataloader(config, split='train'):
             pin_memory=True,
             collate_fn=he_collate_fn
         )
+        return dataloader
     else:
         raise ValueError(f"Unknown modality: {modality}")
-    return dataloader
